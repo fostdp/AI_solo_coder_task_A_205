@@ -7,29 +7,45 @@ import (
 	"sail-simulation/pkg/models"
 )
 
-type GradientDescentOptimizer struct {
+type AdamOptimizer struct {
 	learningRate         float64
+	beta1                float64
+	beta2                float64
+	epsilon              float64
 	maxIterations        int
 	convergenceThreshold float64
 	aeroSolver           *aerodynamics.AerodynamicSolver
+	useNesterov          bool
+	useBacktracking      bool
 }
 
-func NewGradientDescentOptimizer(solver *aerodynamics.AerodynamicSolver) *GradientDescentOptimizer {
-	return &GradientDescentOptimizer{
-		learningRate:         0.1,
-		maxIterations:        200,
+func NewAdamOptimizer(solver *aerodynamics.AerodynamicSolver) *AdamOptimizer {
+	return &AdamOptimizer{
+		learningRate:         0.5,
+		beta1:                0.9,
+		beta2:                0.999,
+		epsilon:              1e-8,
+		maxIterations:        100,
 		convergenceThreshold: 1e-5,
 		aeroSolver:           solver,
+		useNesterov:          true,
+		useBacktracking:      true,
 	}
 }
 
-func (gdo *GradientDescentOptimizer) SetParams(learningRate float64, maxIter int, threshold float64) {
-	gdo.learningRate = learningRate
-	gdo.maxIterations = maxIter
-	gdo.convergenceThreshold = threshold
+func (adam *AdamOptimizer) SetParams(lr float64, maxIter int, threshold float64) {
+	adam.learningRate = lr
+	adam.maxIterations = maxIter
+	adam.convergenceThreshold = threshold
 }
 
-func (gdo *GradientDescentOptimizer) CalculateHullDrag(ship *models.Ship, shipSpeed float64, waterDensity float64) float64 {
+func (adam *AdamOptimizer) SetAdamParams(beta1, beta2, epsilon float64) {
+	adam.beta1 = beta1
+	adam.beta2 = beta2
+	adam.epsilon = epsilon
+}
+
+func (adam *AdamOptimizer) CalculateHullDrag(ship *models.Ship, shipSpeed float64, waterDensity float64) float64 {
 	if shipSpeed < 0.001 {
 		return 0
 	}
@@ -56,7 +72,7 @@ func (gdo *GradientDescentOptimizer) CalculateHullDrag(ship *models.Ship, shipSp
 	return Ct * q
 }
 
-func (gdo *GradientDescentOptimizer) EvaluateObjective(
+func (adam *AdamOptimizer) EvaluateObjective(
 	sailAngle float64,
 	ship *models.Ship,
 	sail *models.Sail,
@@ -76,15 +92,15 @@ func (gdo *GradientDescentOptimizer) EvaluateObjective(
 		AirDensity:    sensor.AirDensity,
 	}
 
-	aero := gdo.aeroSolver.Solve(sail, testSensor)
+	aero := adam.aeroSolver.Solve(sail, testSensor)
 
-	aoa := gdo.aeroSolver.CalculateAngleOfAttack(sensor.WindDirection, sailAngle, sensor.Heading)
-	thrust := gdo.aeroSolver.CalculateThrust(
+	aoa := adam.aeroSolver.CalculateAngleOfAttack(sensor.WindDirection, sailAngle, sensor.Heading)
+	thrust := adam.aeroSolver.CalculateThrust(
 		aero.LiftForce, aero.DragForce, aoa, sailAngle, sensor.Heading, sensor.WindDirection,
 	)
 
 	waterDensity := 1025.0
-	hullDrag := gdo.CalculateHullDrag(ship, sensor.ShipSpeed, waterDensity)
+	hullDrag := adam.CalculateHullDrag(ship, sensor.ShipSpeed, waterDensity)
 
 	netForce := thrust - hullDrag
 	if netForce < 0 {
@@ -98,21 +114,64 @@ func (gdo *GradientDescentOptimizer) EvaluateObjective(
 	return predictedSpeed, aero
 }
 
-func (gdo *GradientDescentOptimizer) ComputeGradient(
+func (adam *AdamOptimizer) ComputeGradient(
 	sailAngle float64,
 	ship *models.Ship,
 	sail *models.Sail,
 	sensor *models.SensorData,
 ) float64 {
-	eps := 0.5
+	eps := 0.25
 
-	fPlus, _ := gdo.EvaluateObjective(sailAngle+eps, ship, sail, sensor)
-	fMinus, _ := gdo.EvaluateObjective(sailAngle-eps, ship, sail, sensor)
+	fPlus, _ := adam.EvaluateObjective(sailAngle+eps, ship, sail, sensor)
+	fMinus, _ := adam.EvaluateObjective(sailAngle-eps, ship, sail, sensor)
 
 	return (fPlus - fMinus) / (2 * eps)
 }
 
-func (gdo *GradientDescentOptimizer) OptimizeSailAngle(
+func (adam *AdamOptimizer) backtrackingLineSearch(
+	currentAngle float64,
+	currentSpeed float64,
+	grad float64,
+	direction float64,
+	ship *models.Ship,
+	sail *models.Sail,
+	sensor *models.SensorData,
+	initialStep float64,
+) (float64, float64, *models.AerodynamicResult) {
+	if !adam.useBacktracking {
+		newAngle := currentAngle + initialStep*direction
+		newAngle = clampAngle(newAngle)
+		newSpeed, newAero := adam.EvaluateObjective(newAngle, ship, sail, sensor)
+		return initialStep, newSpeed, newAero
+	}
+
+	step := initialStep
+	rho := 0.5
+	c := 1e-4
+
+	for i := 0; i < 20; i++ {
+		newAngle := currentAngle + step*direction
+		newAngle = clampAngle(newAngle)
+
+		newSpeed, newAero := adam.EvaluateObjective(newAngle, ship, sail, sensor)
+
+		sufficientIncrease := c * step * grad * direction
+
+		if newSpeed >= currentSpeed+sufficientIncrease || step < 1e-4 {
+			return step, newSpeed, newAero
+		}
+
+		step *= rho
+	}
+
+	return step, currentSpeed, nil
+}
+
+func clampAngle(angle float64) float64 {
+	return math.Max(-80, math.Min(80, angle))
+}
+
+func (adam *AdamOptimizer) OptimizeSailAngle(
 	ship *models.Ship,
 	sail *models.Sail,
 	sensor *models.SensorData,
@@ -123,49 +182,84 @@ func (gdo *GradientDescentOptimizer) OptimizeSailAngle(
 	bestSpeed := 0.0
 	var bestAero *models.AerodynamicResult
 
-	initialSpeed, initialAero := gdo.EvaluateObjective(currentAngle, ship, sail, sensor)
+	initialSpeed, initialAero := adam.EvaluateObjective(currentAngle, ship, sail, sensor)
 	waterDensity := 1025.0
-	initialHullDrag := gdo.CalculateHullDrag(ship, sensor.ShipSpeed, waterDensity)
+	initialHullDrag := adam.CalculateHullDrag(ship, sensor.ShipSpeed, waterDensity)
 
-	aoa := gdo.aeroSolver.CalculateAngleOfAttack(sensor.WindDirection, currentAngle, sensor.Heading)
-	initialThrust := gdo.aeroSolver.CalculateThrust(
+	aoa := adam.aeroSolver.CalculateAngleOfAttack(sensor.WindDirection, currentAngle, sensor.Heading)
+	initialThrust := adam.aeroSolver.CalculateThrust(
 		initialAero.LiftForce, initialAero.DragForce, aoa, currentAngle, sensor.Heading, sensor.WindDirection,
 	)
 	initialNetThrust := initialThrust - initialHullDrag
 
-	lr := gdo.learningRate
+	m := 0.0
+	v := 0.0
+
+	lr := adam.learningRate
+
 	iteration := 0
 	prevSpeed := initialSpeed
 
-	for iteration < gdo.maxIterations {
-		grad := gdo.ComputeGradient(currentAngle, ship, sail, sensor)
+	bestSpeed = initialSpeed
+	bestAngle = currentAngle
+	bestAero = initialAero
+
+	consecutiveNoImprove := 0
+	maxConsecutiveNoImprove := 8
+
+	for iteration < adam.maxIterations {
+		gradAngle := currentAngle
+		if adam.useNesterov {
+			lookaheadBias := 0.5
+			lookahead := m * lookaheadBias
+			gradAngle = currentAngle + lookahead
+		}
+
+		grad := adam.ComputeGradient(gradAngle, ship, sail, sensor)
 
 		if math.Abs(grad) < 1e-8 {
 			break
 		}
 
-		newAngle := currentAngle + lr*grad
-		newAngle = math.Max(-80, math.Min(80, newAngle))
+		m = adam.beta1*m + (1-adam.beta1)*grad
+		v = adam.beta2*v + (1-adam.beta2)*grad*grad
 
-		newSpeed, newAero := gdo.EvaluateObjective(newAngle, ship, sail, sensor)
+		mHat := m / (1 - math.Pow(adam.beta1, float64(iteration+1)))
+		vHat := v / (1 - math.Pow(adam.beta2, float64(iteration+1)))
 
-		if newSpeed > bestSpeed && !newAero.IsStalled {
+		update := lr * mHat / (math.Sqrt(vHat) + adam.epsilon)
+		direction := 1.0
+		if grad < 0 {
+			direction = -1.0
+		}
+
+		step, newSpeed, newAero := adam.backtrackingLineSearch(
+			currentAngle, prevSpeed, grad, direction, ship, sail, sensor, math.Abs(update),
+		)
+
+		newAngle := currentAngle + step*direction
+		newAngle = clampAngle(newAngle)
+
+		if newAero != nil && newSpeed > bestSpeed && !newAero.IsStalled {
 			bestSpeed = newSpeed
 			bestAngle = newAngle
 			bestAero = newAero
+			consecutiveNoImprove = 0
+		} else {
+			consecutiveNoImprove++
+			if consecutiveNoImprove >= maxConsecutiveNoImprove {
+				break
+			}
 		}
 
-		if math.Abs(newSpeed-prevSpeed) < gdo.convergenceThreshold {
+		if math.Abs(newSpeed-prevSpeed) < adam.convergenceThreshold {
 			break
 		}
 
 		if newSpeed <= prevSpeed {
-			lr *= 0.5
-			if lr < 1e-4 {
-				break
-			}
+			lr *= 0.7
 		} else {
-			lr = math.Min(lr*1.1, 1.0)
+			lr = math.Min(lr*1.05, 2.0)
 		}
 
 		currentAngle = newAngle
@@ -179,9 +273,9 @@ func (gdo *GradientDescentOptimizer) OptimizeSailAngle(
 		bestAngle = currentAngle
 	}
 
-	optimizedHullDrag := gdo.CalculateHullDrag(ship, bestSpeed, waterDensity)
-	aoaOpt := gdo.aeroSolver.CalculateAngleOfAttack(sensor.WindDirection, bestAngle, sensor.Heading)
-	optimizedThrust := gdo.aeroSolver.CalculateThrust(
+	optimizedHullDrag := adam.CalculateHullDrag(ship, bestSpeed, waterDensity)
+	aoaOpt := adam.aeroSolver.CalculateAngleOfAttack(sensor.WindDirection, bestAngle, sensor.Heading)
+	optimizedThrust := adam.aeroSolver.CalculateThrust(
 		bestAero.LiftForce, bestAero.DragForce, aoaOpt, bestAngle, sensor.Heading, sensor.WindDirection,
 	)
 	optimizedNetThrust := optimizedThrust - optimizedHullDrag
@@ -203,12 +297,18 @@ func (gdo *GradientDescentOptimizer) OptimizeSailAngle(
 		WindSpeedUsed:        sensor.WindSpeed,
 		WindDirectionUsed:    sensor.WindDirection,
 		Iterations:           iteration,
-		ConvergenceThreshold: gdo.convergenceThreshold,
+		ConvergenceThreshold: adam.convergenceThreshold,
 		HullDragInitial:      initialHullDrag,
 		HullDragOptimized:    optimizedHullDrag,
 		NetThrustInitial:     initialNetThrust,
 		NetThrustOptimized:   optimizedNetThrust,
 	}
+}
+
+type GradientDescentOptimizer = AdamOptimizer
+
+func NewGradientDescentOptimizer(solver *aerodynamics.AerodynamicSolver) *GradientDescentOptimizer {
+	return NewAdamOptimizer(solver)
 }
 
 func (gdo *GradientDescentOptimizer) FindMaxLDRatioAngle(sail *models.Sail, windSpeed float64) float64 {

@@ -239,13 +239,20 @@ func (bls *BoundaryLayerSolver) CalculateSkinFriction(Re float64, isTurbulent bo
 type AerodynamicSolver struct {
 	vortexLattice *VortexLatticeSolver
 	boundaryLayer *BoundaryLayerSolver
+	vpm           *VPMSolver
 	stallAngle    float64
+	velocityDist  []float64
+	separationX   float64
+	isSeparated   bool
+	shapeFactor   float64
+	vpmParticles  int
 }
 
 func NewAerodynamicSolver() *AerodynamicSolver {
 	return &AerodynamicSolver{
 		vortexLattice: NewVortexLatticeSolver(8, 12),
 		boundaryLayer: NewBoundaryLayerSolver(),
+		vpm:           NewVPMSolver(20),
 		stallAngle:    18.0,
 	}
 }
@@ -295,6 +302,38 @@ func (as *AerodynamicSolver) Solve(sail *models.Sail, sensor *models.SensorData)
 		totalCirculation += math.Abs(gamma)
 	}
 
+	as.velocityDist = as.vpm.ComputeVelocityDistribution(aoa, sail.Camber, sail.ChordLength, cl, 30)
+	as.separationX = as.vpm.ComputeSeparationPoint(aoa, sail.Camber, sail.ChordLength, Re, as.velocityDist)
+	as.isSeparated = as.vpm.IsSeparated()
+	as.shapeFactor = as.vpm.GetShapeFactor()
+
+	as.vpmParticles = as.vpm.GenerateBoundaryLayerParticles(
+		sail.ChordLength, sail.SpanLength, sail.Camber,
+		aoa, cl, cdPressure, Re, as.velocityDist,
+	)
+
+	if as.isSeparated {
+		correctedCl, correctedCd := as.vpm.CorrectAerodynamicCoefficients(cl, cdTotal, Re, aoa, sail.AspectRatio)
+		cl = correctedCl
+		cdTotal = correctedCd
+
+		if aoaAbs < as.stallAngle {
+			result.IsStalled = true
+		}
+	}
+
+	if as.isSeparated && aoaAbs < as.stallAngle {
+		sepProgress := (1.0 - as.separationX) / 0.5
+		sepProgress = math.Min(1.0, sepProgress)
+		cl *= (1.0 - sepProgress*0.15)
+		cdTotal *= (1.0 + sepProgress*0.25)
+	}
+
+	bltVpm := blt
+	if as.isSeparated {
+		bltVpm = blt * (1.0 + (1.0-as.separationX)*2.5)
+	}
+
 	result.LiftCoefficient = cl
 	result.DragCoefficient = cdTotal
 	result.LiftForce = cl * q
@@ -303,9 +342,9 @@ func (as *AerodynamicSolver) Solve(sail *models.Sail, sensor *models.SensorData)
 	result.FrictionDrag = cdFriction * q
 	result.InducedDrag = cdInduced * q
 	result.ReynoldsNumber = Re
-	result.BoundaryLayerThickness = blt
+	result.BoundaryLayerThickness = bltVpm
 	result.CirculationStrength = totalCirculation
-	result.TotalVortices = vl.TotalVortices
+	result.TotalVortices = vl.TotalVortices + as.vpmParticles
 
 	return result
 }
