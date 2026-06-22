@@ -1,9 +1,14 @@
 package models
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 type Ship struct {
+	ID           int       `json:"id"`
 	ShipID       int       `json:"ship_id"`
+	Name         string    `json:"name"`
 	ShipName     string    `json:"ship_name"`
 	ShipType     string    `json:"ship_type"`
 	HullLength   float64   `json:"hull_length"`
@@ -13,8 +18,10 @@ type Ship struct {
 }
 
 type Sail struct {
+	ID           int       `json:"id"`
 	SailID       int       `json:"sail_id"`
 	ShipID       int       `json:"ship_id"`
+	Name         string    `json:"name"`
 	SailName     string    `json:"sail_name"`
 	SailPosition string    `json:"sail_position"`
 	Area         float64   `json:"area"`
@@ -55,6 +62,16 @@ type AerodynamicResult struct {
 	IsStalled              bool      `json:"is_stalled"`
 	CirculationStrength    float64   `json:"circulation_strength"`
 	TotalVortices          int       `json:"total_vortices"`
+	EffectiveWind          float64   `json:"effective_wind"`
+	LDRatio                float64   `json:"ld_ratio"`
+	TransitionPoint        float64   `json:"transition_point"`
+	IsSeparated            bool      `json:"is_separated"`
+	SeparationPoint        float64   `json:"separation_point"`
+	ShapeFactor            float64   `json:"shape_factor"`
+	VPMParticleCount       int       `json:"vpm_particle_count"`
+	ClCorrected            float64   `json:"cl_corrected"`
+	CdCorrected            float64   `json:"cd_corrected"`
+	BoundaryLayerThk       float64   `json:"-"`
 }
 
 type OptimizationResult struct {
@@ -74,6 +91,17 @@ type OptimizationResult struct {
 	HullDragOptimized    float64   `json:"hull_drag_optimized"`
 	NetThrustInitial     float64   `json:"net_thrust_initial"`
 	NetThrustOptimized   float64   `json:"net_thrust_optimized"`
+	CurrentAngle         float64   `json:"current_angle"`
+	OptimalAngle         float64   `json:"optimal_angle"`
+	PredictedSpeed       float64   `json:"predicted_speed"`
+	PredictedLift        float64   `json:"predicted_lift"`
+	PredictedDrag        float64   `json:"predicted_drag"`
+	PredictedThrust      float64   `json:"predicted_thrust"`
+	ConvergenceValue     float64   `json:"convergence_value"`
+	Converged            bool      `json:"converged"`
+	LearningRate         float64   `json:"learning_rate"`
+	AngleAdjustment      float64   `json:"angle_adjustment"`
+	EfficiencyGain       float64   `json:"efficiency_gain"`
 }
 
 type AlertEvent struct {
@@ -87,6 +115,14 @@ type AlertEvent struct {
 	ThresholdValue *float64  `json:"threshold_value,omitempty"`
 	Acknowledged   bool      `json:"acknowledged"`
 	Resolved       bool      `json:"resolved"`
+}
+
+func (a *AlertEvent) CompositeKey() string {
+	sailID := 0
+	if a.SailID != nil {
+		sailID = *a.SailID
+	}
+	return fmt.Sprintf("%d_%d_%s", a.ShipID, sailID, a.AlertType)
 }
 
 type PolarCurve struct {

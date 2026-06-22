@@ -1,0 +1,47 @@
+{
+    "vortex_lattice": {
+        "chordwise_panels": 8,
+        "spanwise_panels": 12,
+        "vortex_core_radius": 0.0001
+    },
+    "boundary_layer": {
+        "transition_reynolds": 500000,
+        "kinematic_viscosity": 1.46e-5
+    },
+    "stall": {
+        "stall_angle_deg": 18.0,
+        "lift_decay_factor": 0.08,
+        "drag_increase_factor": 0.15
+    },
+    "vpm": {
+        "chordwise_panels": 20,
+        "particles_per_panel": 4,
+        "separation_shape_factor_threshold": 2.8,
+        "trailing_particles_count": 20,
+        "separation_lift_correction": 0.35,
+        "separation_drag_base": 0.08,
+        "span_efficiency_base": 0.95,
+        "span_efficiency_separated": 0.85,
+        "boundary_layer_expansion_factor": 2.5,
+        "bl_separation_correction_lift": 0.15,
+        "bl_separation_correction_drag": 0.25
+    },
+    "airfoil": {
+        "minimum_drag_coefficient": 0.008,
+        "camber_drag_factor": 0.01,
+        "pressure_drag_base": 0.02,
+        "pressure_drag_exponent": 1.5
+    },
+    "default_sail": {
+        "area": 150.0,
+        "aspect_ratio": 2.8,
+        "chord_length": 7.3,
+        "span_length": 20.5,
+        "camber": 0.13
+    },
+    "default_ship": {
+        "hull_length": 30.5,
+        "hull_width": 9.8,
+        "displacement": 600.0
+    }
+}

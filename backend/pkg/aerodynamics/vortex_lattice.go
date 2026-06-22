@@ -246,6 +246,7 @@ type AerodynamicSolver struct {
 	isSeparated   bool
 	shapeFactor   float64
 	vpmParticles  int
+	sail          *models.Sail
 }
 
 func NewAerodynamicSolver() *AerodynamicSolver {
@@ -255,6 +256,22 @@ func NewAerodynamicSolver() *AerodynamicSolver {
 		vpm:           NewVPMSolver(20),
 		stallAngle:    18.0,
 	}
+}
+
+func NewAerodynamicSolver(sail *models.Sail, chordPanels, spanPanels int, transitionRe float64) *AerodynamicSolver {
+	s := &AerodynamicSolver{
+		vortexLattice: NewVortexLatticeSolver(chordPanels, spanPanels),
+		boundaryLayer: NewBoundaryLayerSolver(),
+		vpm:           NewVPMSolver(20),
+		stallAngle:    18.0,
+		sail:          sail,
+	}
+	s.boundaryLayer.transitionRe = transitionRe
+	return s
+}
+
+func (as *AerodynamicSolver) UpdateSailGeometry(sail *models.Sail) {
+	as.sail = sail
 }
 
 func (as *AerodynamicSolver) Solve(sail *models.Sail, sensor *models.SensorData) *models.AerodynamicResult {
@@ -453,4 +470,123 @@ func (as *AerodynamicSolver) CalculateThrust(lift, drag, aoa, sailAngle, heading
 	thrustY := (liftY + dragY) * math.Sin(headingRad)
 
 	return math.Sqrt(thrustX*thrustX + thrustY*thrustY)
+}
+
+type AeroSolveResult struct {
+	LiftCoefficient        float64
+	DragCoefficient        float64
+	LiftForce              float64
+	DragForce              float64
+	PressureDrag           float64
+	FrictionDrag           float64
+	InducedDrag            float64
+	ReynoldsNumber         float64
+	BoundaryLayerThickness float64
+	IsStalled              bool
+	TransitionPoint        float64
+	IsSeparated            bool
+	SeparationPoint        float64
+	ShapeFactor            float64
+	VPMParticleCount       int
+	ClCorrected            float64
+	CdCorrected            float64
+	AngleOfAttack          float64
+}
+
+func (as *AerodynamicSolver) Solve(aoa, effectiveWindSpeed, airDensity, stallAngle float64) (*AeroSolveResult, error) {
+	const kinematicViscosity = 1.460e-5
+	sail := as.sail
+	if sail == nil {
+		sail = &models.Sail{
+			Area:        150.0,
+			AspectRatio: 2.8,
+			ChordLength: 7.3,
+			SpanLength:  20.5,
+			Camber:      0.13,
+		}
+	}
+
+	aoaAbs := math.Abs(aoa)
+	q := 0.5 * airDensity * effectiveWindSpeed * effectiveWindSpeed * sail.Area
+
+	cl, cdInduced := as.calculateAirfoilCoefficients(aoa, sail)
+	Re := as.boundaryLayer.CalculateReynoldsNumber(effectiveWindSpeed, sail.ChordLength, kinematicViscosity)
+	isTurbulent := Re > as.boundaryLayer.transitionRe
+
+	blt := as.boundaryLayer.CalculateBoundaryLayerThickness(Re, sail.ChordLength, isTurbulent)
+	cf := as.boundaryLayer.CalculateSkinFriction(Re, isTurbulent)
+	transitionX := 0.0
+	if isTurbulent {
+		transitionX = (as.boundaryLayer.transitionRe * kinematicViscosity) / effectiveWindSpeed
+	}
+
+	cdFriction := 2 * cf * (1 + 2*sail.Camber)
+	cdPressure := as.calculatePressureDrag(aoaAbs, sail.Camber)
+
+	cdTotal := cdInduced + cdFriction + cdPressure
+	isStalled := aoaAbs > stallAngle
+	if isStalled {
+		cl *= as.stallLiftFactor(aoaAbs)
+		cdTotal *= as.stallDragFactor(aoaAbs)
+	}
+
+	vl := as.vortexLattice.GenerateLattice(sail)
+	as.vortexLattice.CalculateInfluenceMatrix(vl)
+	as.vortexLattice.SolveCirculation(vl, aoa, effectiveWindSpeed)
+
+	as.velocityDist = as.vpm.ComputeVelocityDistribution(aoa, sail.Camber, sail.ChordLength, cl, 30)
+	as.separationX = as.vpm.ComputeSeparationPoint(aoa, sail.Camber, sail.ChordLength, Re, as.velocityDist)
+	as.isSeparated = as.vpm.IsSeparated()
+	as.shapeFactor = as.vpm.GetShapeFactor()
+
+	clCorrected := cl
+	cdCorrected := cdTotal
+	as.vpmParticles = as.vpm.GenerateBoundaryLayerParticles(
+		sail.ChordLength, sail.SpanLength, sail.Camber,
+		aoa, cl, cdPressure, Re, as.velocityDist,
+	)
+
+	if as.isSeparated {
+		correctedCl, correctedCd := as.vpm.CorrectAerodynamicCoefficients(cl, cdTotal, Re, aoa, sail.AspectRatio)
+		clCorrected = correctedCl
+		cdCorrected = correctedCd
+		cl = correctedCl
+		cdTotal = correctedCd
+		if aoaAbs < stallAngle {
+			isStalled = true
+		}
+	}
+
+	if as.isSeparated && aoaAbs < stallAngle {
+		sepProgress := (1.0 - as.separationX) / 0.5
+		sepProgress = math.Min(1.0, sepProgress)
+		cl *= (1.0 - sepProgress*0.15)
+		cdTotal *= (1.0 + sepProgress*0.25)
+	}
+
+	bltVpm := blt
+	if as.isSeparated {
+		bltVpm = blt * (1.0 + (1.0-as.separationX)*2.5)
+	}
+
+	return &AeroSolveResult{
+		LiftCoefficient:        cl,
+		DragCoefficient:        cdTotal,
+		LiftForce:              cl * q,
+		DragForce:              cdTotal * q,
+		PressureDrag:           cdPressure * q,
+		FrictionDrag:           cdFriction * q,
+		InducedDrag:            cdInduced * q,
+		ReynoldsNumber:         Re,
+		BoundaryLayerThickness: bltVpm,
+		IsStalled:              isStalled,
+		TransitionPoint:        transitionX,
+		IsSeparated:            as.isSeparated,
+		SeparationPoint:        as.separationX,
+		ShapeFactor:            as.shapeFactor,
+		VPMParticleCount:       as.vpmParticles,
+		ClCorrected:            clCorrected,
+		CdCorrected:            cdCorrected,
+		AngleOfAttack:          aoa,
+	}, nil
 }
