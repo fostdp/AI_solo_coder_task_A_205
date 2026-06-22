@@ -203,3 +203,166 @@ VALUES
     (NULL, 'min_ship_speed', 1.0, 0.5),
     (NULL, 'max_wind_speed', 20.0, 30.0)
 ON CONFLICT DO NOTHING;
+
+-- ============================================
+-- 降采样连续聚合视图
+-- ============================================
+
+-- 5分钟降采样：传感器数据
+CREATE MATERIALIZED VIEW IF NOT EXISTS sensor_data_5min
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('5 minutes', time) AS bucket,
+    ship_id,
+    sail_id,
+    AVG(wind_speed) AS avg_wind_speed,
+    MAX(wind_speed) AS max_wind_speed,
+    MIN(wind_speed) AS min_wind_speed,
+    STDDEV(wind_speed) AS stddev_wind_speed,
+    AVG(wind_direction) AS avg_wind_direction,
+    AVG(sail_angle) AS avg_sail_angle,
+    AVG(ship_speed) AS avg_ship_speed,
+    MAX(ship_speed) AS max_ship_speed,
+    MIN(ship_speed) AS min_ship_speed,
+    COUNT(*) AS sample_count
+FROM sensor_data
+GROUP BY bucket, ship_id, sail_id
+WITH NO DATA;
+
+-- 15分钟降采样：气动结果
+CREATE MATERIALIZED VIEW IF NOT EXISTS aero_results_15min
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('15 minutes', time) AS bucket,
+    ship_id,
+    sail_id,
+    AVG(lift_coefficient) AS avg_lift_coefficient,
+    AVG(drag_coefficient) AS avg_drag_coefficient,
+    AVG(lift_force) AS avg_lift_force,
+    AVG(drag_force) AS avg_drag_force,
+    MAX(CASE WHEN is_stalled THEN 1 ELSE 0 END) AS stall_events,
+    COUNT(*) AS sample_count
+FROM aerodynamic_results
+GROUP BY bucket, ship_id, sail_id
+WITH NO DATA;
+
+-- 1小时降采样：优化结果
+CREATE MATERIALIZED VIEW IF NOT EXISTS optimization_results_hourly
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 hour', time) AS bucket,
+    ship_id,
+    sail_id,
+    AVG(optimal_sail_angle) AS avg_optimal_angle,
+    AVG(optimized_ship_speed) AS avg_optimized_speed,
+    AVG(speed_increase) AS avg_speed_increase,
+    AVG(iterations) AS avg_iterations,
+    COUNT(*) AS sample_count
+FROM optimization_results
+GROUP BY bucket, ship_id, sail_id
+WITH NO DATA;
+
+-- ============================================
+-- 自动刷新策略（连续聚合自动更新）
+-- ============================================
+
+SELECT add_continuous_aggregate_policy('sensor_data_hourly',
+    start_offset => INTERVAL '3 hours',
+    end_offset => INTERVAL '1 hour',
+    schedule_interval => INTERVAL '1 hour',
+    if_not_exists => TRUE);
+
+SELECT add_continuous_aggregate_policy('sensor_data_5min',
+    start_offset => INTERVAL '30 minutes',
+    end_offset => INTERVAL '5 minutes',
+    schedule_interval => INTERVAL '5 minutes',
+    if_not_exists => TRUE);
+
+SELECT add_continuous_aggregate_policy('aero_results_15min',
+    start_offset => INTERVAL '1 hour',
+    end_offset => INTERVAL '15 minutes',
+    schedule_interval => INTERVAL '15 minutes',
+    if_not_exists => TRUE);
+
+SELECT add_continuous_aggregate_policy('optimization_results_hourly',
+    start_offset => INTERVAL '3 hours',
+    end_offset => INTERVAL '1 hour',
+    schedule_interval => INTERVAL '1 hour',
+    if_not_exists => TRUE);
+
+SELECT add_continuous_aggregate_policy('alerts_daily',
+    start_offset => INTERVAL '3 days',
+    end_offset => INTERVAL '1 day',
+    schedule_interval => INTERVAL '1 day',
+    if_not_exists => TRUE);
+
+-- ============================================
+-- 数据保留策略（自动清理过期数据）
+-- ============================================
+
+-- 原始传感器数据保留90天
+SELECT add_retention_policy('sensor_data', INTERVAL '90 days',
+    if_not_exists => TRUE);
+
+-- 原始气动结果保留90天
+SELECT add_retention_policy('aerodynamic_results', INTERVAL '90 days',
+    if_not_exists => TRUE);
+
+-- 原始优化结果保留180天
+SELECT add_retention_policy('optimization_results', INTERVAL '180 days',
+    if_not_exists => TRUE);
+
+-- 告警事件保留365天
+SELECT add_retention_policy('alert_events', INTERVAL '365 days',
+    if_not_exists => TRUE);
+
+-- 5分钟降采样保留1年
+SELECT add_retention_policy('sensor_data_5min', INTERVAL '1 year',
+    if_not_exists => TRUE);
+
+-- 15分钟降采样保留2年
+SELECT add_retention_policy('aero_results_15min', INTERVAL '2 years',
+    if_not_exists => TRUE);
+
+-- 小时降采样永久保留
+-- (sensor_data_hourly, aero_results_hourly, optimization_results_hourly 无保留策略)
+
+-- ============================================
+-- 压缩策略（节省存储空间）
+-- ============================================
+
+-- 传感器数据7天后压缩
+ALTER TABLE sensor_data SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'ship_id, sail_id',
+    timescaledb.compress_orderby = 'time DESC'
+);
+SELECT add_compression_policy('sensor_data', INTERVAL '7 days',
+    if_not_exists => TRUE);
+
+-- 气动结果7天后压缩
+ALTER TABLE aerodynamic_results SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'ship_id, sail_id',
+    timescaledb.compress_orderby = 'time DESC'
+);
+SELECT add_compression_policy('aerodynamic_results', INTERVAL '7 days',
+    if_not_exists => TRUE);
+
+-- 优化结果14天后压缩
+ALTER TABLE optimization_results SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'ship_id, sail_id',
+    timescaledb.compress_orderby = 'time DESC'
+);
+SELECT add_compression_policy('optimization_results', INTERVAL '14 days',
+    if_not_exists => TRUE);
+
+-- 告警事件30天后压缩
+ALTER TABLE alert_events SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'ship_id, severity',
+    timescaledb.compress_orderby = 'time DESC'
+);
+SELECT add_compression_policy('alert_events', INTERVAL '30 days',
+    if_not_exists => TRUE);

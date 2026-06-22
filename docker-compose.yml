@@ -1,0 +1,87 @@
+version: "3.8"
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:2.13.1-pg15
+    container_name: sail-timescaledb
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: sail_simulation
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sail_simulation"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0.18
+    container_name: sail-mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sail-backend
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@timescaledb:5432/sail_simulation?sslmode=disable
+      UDP_ADDR: ":8001"
+      HTTP_ADDR: ":8080"
+      METRICS_ADDR: ":9090"
+      MQTT_BROKER: tcp://mosquitto:1883
+      MQTT_TOPIC: sail/sensor
+      CONFIG_PATH: /config
+      FRONTEND_DIR: /frontend
+    ports:
+      - "8080:8080"
+      - "8001:8001/udp"
+      - "9090:9090"
+    volumes:
+      - ./config:/config:ro
+      - ./frontend:/frontend:ro
+    restart: unless-stopped
+
+  simulator:
+    build:
+      context: ./simulator
+      dockerfile: Dockerfile
+    container_name: sail-simulator
+    depends_on:
+      - backend
+      - mosquitto
+    environment:
+      MQTT_BROKER: tcp://mosquitto:1883
+      WIND_SPEED: ""
+      WIND_DIRECTION: ""
+      FAST_MODE: "true"
+    command: >
+      python sensor_simulator.py
+      --fast
+      --host backend
+      --port 8001
+      --mqtt-broker tcp://mosquitto:1883
+      --mqtt-topic sail/sensor
+    restart: unless-stopped
+
+volumes:
+  timescaledb_data:
+  mosquitto_data:
+  mosquitto_log:

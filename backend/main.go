@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
@@ -15,11 +16,18 @@ import (
 
 	"sail-simulation/pkg/aerodynamics"
 	"sail-simulation/pkg/config"
+	"sail-simulation/pkg/metrics"
+	"sail-simulation/pkg/middleware"
 	"sail-simulation/pkg/models"
 	"sail-simulation/pkg/modules"
 	"sail-simulation/pkg/optimizer"
 	"sail-simulation/pkg/storage"
 	ws "sail-simulation/pkg/websocket"
+)
+
+var (
+	version   = "dev"
+	buildTime = "unknown"
 )
 
 type Server struct {
@@ -28,10 +36,14 @@ type Server struct {
 	aeroSolver *aerodynamics.AerodynamicSolver
 	udpAddr    string
 	httpAddr   string
+	metricsAddr string
+	mqttBroker string
+	mqttTopic  string
 	thresholds map[string]models.AlertThreshold
 	aeroCfg    *config.AerodynamicsConfig
 	optCfg     *config.OptimizerConfig
 	alarmWS    *modules.AlarmWS
+	configPath string
 }
 
 func NewServer() (*Server, error) {
@@ -42,11 +54,15 @@ func NewServer() (*Server, error) {
 		log.Println("Running in memory-only mode")
 	}
 
-	aeroCfg, err := config.LoadAerodynamicsConfig("../config/aerodynamics.json")
+	configPath := getEnv("CONFIG_PATH", "../config")
+	aeroCfgPath := configPath + "/aerodynamics.json"
+	optCfgPath := configPath + "/optimizer.json"
+
+	aeroCfg, err := config.LoadAerodynamicsConfig(aeroCfgPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load aerodynamics config: %w", err)
 	}
-	optCfg, err := config.LoadOptimizerConfig("../config/optimizer.json")
+	optCfg, err := config.LoadOptimizerConfig(optCfgPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load optimizer config: %w", err)
 	}
@@ -66,11 +82,15 @@ func NewServer() (*Server, error) {
 			aeroCfg.VortexLattice.SpanwisePanels,
 			aeroCfg.BoundaryLayer.TransitionReynolds,
 		),
-		udpAddr:    getEnv("UDP_ADDR", ":8001"),
-		httpAddr:   getEnv("HTTP_ADDR", ":8080"),
-		thresholds: make(map[string]models.AlertThreshold),
-		aeroCfg:    aeroCfg,
-		optCfg:     optCfg,
+		udpAddr:     getEnv("UDP_ADDR", ":8001"),
+		httpAddr:    getEnv("HTTP_ADDR", ":8080"),
+		metricsAddr: getEnv("METRICS_ADDR", ":9090"),
+		mqttBroker:  getEnv("MQTT_BROKER", ""),
+		mqttTopic:   getEnv("MQTT_TOPIC", "sail/sensor"),
+		thresholds:  make(map[string]models.AlertThreshold),
+		aeroCfg:     aeroCfg,
+		optCfg:      optCfg,
+		configPath:  configPath,
 	}, nil
 }
 
@@ -117,6 +137,10 @@ func (s *Server) Start() error {
 
 	s.loadThresholds(ctx)
 
+	log.Printf("Sail Simulation Backend v%s (built %s)", version, buildTime)
+
+	metrics.StartMetricsServer(s.metricsAddr, ctx)
+
 	sensorRawCh := make(chan *models.SensorData, 100)
 	validatedCh := make(chan *modules.ValidatedSensorData, 100)
 	aeroReqCh := make(chan *modules.AeroSimRequest, 50)
@@ -125,9 +149,25 @@ func (s *Server) Start() error {
 	optResCh := make(chan *modules.OptimizationResult, 50)
 	alertCh := make(chan *modules.AlertEvent, 20)
 
+	metrics.RegisterChannelMetrics("sensor_raw", func() int { return len(sensorRawCh) })
+	metrics.RegisterChannelMetrics("aero_req", func() int { return len(aeroReqCh) })
+	metrics.RegisterChannelMetrics("aero_res", func() int { return len(aeroResCh) })
+	metrics.RegisterChannelMetrics("opt_req", func() int { return len(optReqCh) })
+	metrics.RegisterChannelMetrics("opt_res", func() int { return len(optResCh) })
+	metrics.RegisterChannelMetrics("alert", func() int { return len(alertCh) })
+
 	udpReceiver := modules.NewUDPReceiver(s.udpAddr, sensorRawCh, validatedCh)
 	if err := udpReceiver.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start UDP receiver: %w", err)
+	}
+
+	if s.mqttBroker != "" {
+		mqttReceiver := modules.NewMQTTReceiver(s.mqttBroker, s.mqttTopic, sensorRawCh)
+		if err := mqttReceiver.Start(ctx); err != nil {
+			log.Printf("Warning: Failed to start MQTT receiver: %v", err)
+		} else {
+			log.Printf("MQTT receiver started, broker=%s topic=%s", s.mqttBroker, s.mqttTopic)
+		}
 	}
 
 	aeroSim := modules.NewAerodynamicsSimulator(aeroReqCh, aeroResCh, s.aeroCfg)
@@ -167,11 +207,15 @@ func (s *Server) orchestrator(
 			return
 
 		case sensor := <-sensorRawCh:
+			metrics.SensorValidated.Inc()
 			log.Printf("Pipeline: received sensor ship=%d sail=%d", sensor.ShipID, sensor.SailID)
 
 			if s.store != nil {
 				if err := s.store.InsertSensorData(ctx, sensor); err != nil {
 					log.Printf("Failed to insert sensor data: %v", err)
+					metrics.DBOperations.WithLabelValues("insert_sensor", "error").Inc()
+				} else {
+					metrics.DBOperations.WithLabelValues("insert_sensor", "ok").Inc()
 				}
 			}
 
@@ -201,6 +245,7 @@ func (s *Server) orchestrator(
 			s.checkSensorAlerts(ctx, sensor, alertCh)
 
 		case aeroRes := <-aeroResCh:
+			metrics.AeroSimulations.Inc()
 			if aeroRes.Error != nil {
 				log.Printf("Aero simulation error: %v", aeroRes.Error)
 				continue
@@ -209,9 +254,20 @@ func (s *Server) orchestrator(
 				aeroRes.Sensor.ShipID, aeroRes.Sensor.SailID,
 				aeroRes.Result.LiftCoefficient, aeroRes.Result.DragCoefficient)
 
+			metrics.LiftCoefficient.Set(aeroRes.Result.LiftCoefficient)
+			metrics.DragCoefficient.Set(aeroRes.Result.DragCoefficient)
+			if aeroRes.Result.IsStalled {
+				metrics.StallStatus.Set(1)
+			} else {
+				metrics.StallStatus.Set(0)
+			}
+
 			if s.store != nil {
 				if err := s.store.InsertAerodynamicResult(ctx, aeroRes.Result); err != nil {
 					log.Printf("Failed to insert aero result: %v", err)
+					metrics.DBOperations.WithLabelValues("insert_aero", "error").Inc()
+				} else {
+					metrics.DBOperations.WithLabelValues("insert_aero", "ok").Inc()
 				}
 			}
 
@@ -222,6 +278,7 @@ func (s *Server) orchestrator(
 			}
 
 		case optRes := <-optResCh:
+			metrics.Optimizations.Inc()
 			if optRes.Error != nil {
 				log.Printf("Optimization error: %v", optRes.Error)
 				continue
@@ -230,9 +287,15 @@ func (s *Server) orchestrator(
 				optRes.Request.Sensor.ShipID, optRes.Request.Sensor.SailID,
 				optRes.Result.OptimalAngle, optRes.Result.EfficiencyGain)
 
+			metrics.OptimalAngle.Set(optRes.Result.OptimalAngle)
+			metrics.EfficiencyGain.Set(optRes.Result.EfficiencyGain)
+
 			if s.store != nil {
 				if err := s.store.InsertOptimizationResult(ctx, optRes.Result); err != nil {
 					log.Printf("Failed to insert opt result: %v", err)
+					metrics.DBOperations.WithLabelValues("insert_opt", "error").Inc()
+				} else {
+					metrics.DBOperations.WithLabelValues("insert_opt", "ok").Inc()
 				}
 			}
 
@@ -260,6 +323,7 @@ func (s *Server) checkSensorAlerts(ctx context.Context, sensor *models.SensorDat
 				CurrentValue:   &sensor.ShipSpeed,
 				ThresholdValue: &threshold,
 			}
+			metrics.AlertsTriggered.WithLabelValues("low_speed", severity).Inc()
 			select {
 			case alertCh <- &modules.AlertEvent{Alert: alert, Cooldown: true}:
 			case <-ctx.Done():
@@ -285,6 +349,7 @@ func (s *Server) checkSensorAlerts(ctx context.Context, sensor *models.SensorDat
 				CurrentValue:   &sensor.WindSpeed,
 				ThresholdValue: &threshold,
 			}
+			metrics.AlertsTriggered.WithLabelValues("high_wind", severity).Inc()
 			select {
 			case alertCh <- &modules.AlertEvent{Alert: alert, Cooldown: true}:
 			case <-ctx.Done():
@@ -317,6 +382,8 @@ func (s *Server) triggerStallAlert(ctx context.Context, sensor *models.SensorDat
 		CurrentValue:   &aero.AngleOfAttack,
 		ThresholdValue: &threshold,
 	}
+
+	metrics.AlertsTriggered.WithLabelValues("stall", severity).Inc()
 
 	if s.store != nil {
 		if err := s.store.InsertAlertEvent(ctx, alert); err != nil {
@@ -368,7 +435,6 @@ func (s *Server) startHTTPServer(ctx context.Context, alertCh chan<- *modules.Al
 
 	mux.HandleFunc("/api/ships", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if s.store == nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -383,7 +449,6 @@ func (s *Server) startHTTPServer(ctx context.Context, alertCh chan<- *modules.Al
 
 	mux.HandleFunc("/api/sails", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if s.store == nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -399,7 +464,6 @@ func (s *Server) startHTTPServer(ctx context.Context, alertCh chan<- *modules.Al
 
 	mux.HandleFunc("/api/sensor-data", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if s.store == nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -420,7 +484,6 @@ func (s *Server) startHTTPServer(ctx context.Context, alertCh chan<- *modules.Al
 
 	mux.HandleFunc("/api/aero-results", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if s.store == nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -441,7 +504,6 @@ func (s *Server) startHTTPServer(ctx context.Context, alertCh chan<- *modules.Al
 
 	mux.HandleFunc("/api/optimizations", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if s.store == nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -462,7 +524,6 @@ func (s *Server) startHTTPServer(ctx context.Context, alertCh chan<- *modules.Al
 
 	mux.HandleFunc("/api/alerts", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if s.store == nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -482,7 +543,6 @@ func (s *Server) startHTTPServer(ctx context.Context, alertCh chan<- *modules.Al
 
 	mux.HandleFunc("/api/polar-curve", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		sailID, _ := strconv.Atoi(r.URL.Query().Get("sail_id"))
 		windSpeed, _ := strconv.ParseFloat(r.URL.Query().Get("wind_speed"), 64)
 		if windSpeed == 0 {
@@ -502,7 +562,6 @@ func (s *Server) startHTTPServer(ctx context.Context, alertCh chan<- *modules.Al
 
 	mux.HandleFunc("/api/optimize", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", 405)
 			return
@@ -560,7 +619,6 @@ func (s *Server) startHTTPServer(ctx context.Context, alertCh chan<- *modules.Al
 
 	mux.HandleFunc("/api/ingest", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", 405)
 			return
@@ -579,17 +637,54 @@ func (s *Server) startHTTPServer(ctx context.Context, alertCh chan<- *modules.Al
 		if sensor.AmbientTemp == 0 {
 			sensor.AmbientTemp = 25.0
 		}
+		metrics.SensorReceived.WithLabelValues("http").Inc()
 		log.Printf("HTTP ingest: ship=%d sail=%d wind=%.1f", sensor.ShipID, sensor.SailID, sensor.WindSpeed)
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
 	})
 
-	fs := http.FileServer(http.Dir("../frontend"))
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		status := map[string]interface{}{
+			"status":     "ok",
+			"version":    version,
+			"build_time": buildTime,
+			"uptime":     time.Since(startTime).String(),
+		}
+		if s.store != nil {
+			status["database"] = "connected"
+		} else {
+			status["database"] = "disconnected"
+		}
+		json.NewEncoder(w).Encode(status)
+	})
+
+	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"version":     version,
+			"build_time":  buildTime,
+			"go_version":  "1.21",
+		})
+	})
+
+	pprofMux := http.NewServeMux()
+	pprofMux.HandleFunc("/debug/pprof/", pprof.Index)
+	pprofMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	pprofMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	pprofMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	pprofMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	mux.Handle("/debug/pprof/", pprofMux)
+
+	frontendDir := getEnv("FRONTEND_DIR", "../frontend")
+	fs := http.FileServer(http.Dir(frontendDir))
 	mux.Handle("/", fs)
+
+	handler := middleware.GzipMiddleware(middleware.CORS(mux))
 
 	server := &http.Server{
 		Addr:    s.httpAddr,
-		Handler: mux,
+		Handler: handler,
 	}
 
 	go func() {
@@ -605,9 +700,12 @@ func (s *Server) startHTTPServer(ctx context.Context, alertCh chan<- *modules.Al
 	}
 }
 
+var startTime time.Time
+
 func main() {
+	startTime = time.Now()
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Println("Starting Sail Simulation Backend (Modular Architecture)...")
+	log.Printf("Starting Sail Simulation Backend v%s (built %s)...", version, buildTime)
 
 	server, err := NewServer()
 	if err != nil {

@@ -1,0 +1,6 @@
+sail_sim.exe
+*.exe
+*.test
+*.out
+.git
+.gitignore

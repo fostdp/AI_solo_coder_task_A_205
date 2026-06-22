@@ -15,6 +15,12 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, asdict, field
 from typing import List, Optional
 
+try:
+    import paho.mqtt.client as mqtt
+    MQTT_AVAILABLE = True
+except ImportError:
+    MQTT_AVAILABLE = False
+
 
 @dataclass
 class SailConfig:
@@ -226,12 +232,17 @@ class SailAngleController:
 
 class SensorSimulator:
     def __init__(self, udp_host: str, udp_port: int, interval: float = 60.0,
-                 fast_mode: bool = False, debug: bool = False):
+                 fast_mode: bool = False, debug: bool = False,
+                 mqtt_broker: str = None, mqtt_topic: str = "sail/sensor",
+                 wind_speed: float = None, wind_direction: float = None):
         self.udp_host = udp_host
         self.udp_port = udp_port
         self.interval = interval
         self.fast_mode = fast_mode
         self.debug = debug
+        self.mqtt_broker = mqtt_broker
+        self.mqtt_topic = mqtt_topic
+        self.mqtt_client = None
 
         if self.fast_mode:
             self.interval = 1.0
@@ -249,9 +260,13 @@ class SensorSimulator:
         for ship in SHIP_CONFIGS:
             seed_bonus = ship.ship_id * 100
             random.seed(42 + seed_bonus)
+
+            base_speed = wind_speed if wind_speed is not None else (6.0 + ship.ship_id * 1.5)
+            base_dir = wind_direction if wind_direction is not None else (90.0 + ship.ship_id * 30)
+
             self.wind_sims[ship.ship_id] = WindSimulator(
-                base_speed=6.0 + ship.ship_id * 1.5,
-                base_direction=90.0 + ship.ship_id * 30,
+                base_speed=base_speed,
+                base_direction=base_dir,
             )
             self.ship_motions[ship.ship_id] = ShipMotionSimulator(ship)
 
@@ -260,17 +275,36 @@ class SensorSimulator:
 
         random.seed(None)
 
+        if self.mqtt_broker and MQTT_AVAILABLE:
+            self.mqtt_client = mqtt.Client(client_id=f"sail-sim-{random.randint(1000,9999)}")
+            self.mqtt_client.on_connect = lambda c, u, f, rc: print(f"  MQTT connected to {self.mqtt_broker}" if rc == 0 else f"  MQTT connect failed: {rc}")
+            try:
+                self.mqtt_client.connect(self.mqtt_broker.split(":")[-1],
+                                         int(self.mqtt_broker.split(":")[-2].split("/")[-1]) if ":" in self.mqtt_broker else 1883)
+                self.mqtt_client.loop_start()
+            except Exception as e:
+                print(f"  MQTT connection error: {e}")
+                self.mqtt_client = None
+        elif self.mqtt_broker and not MQTT_AVAILABLE:
+            print("  Warning: paho-mqtt not installed, MQTT publishing disabled")
+
     def send_reading(self, reading: SensorReading):
         payload = json.dumps(asdict(reading), ensure_ascii=False).encode("utf-8")
         try:
             self.sock.sendto(payload, (self.udp_host, self.udp_port))
             if self.debug:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Send -> Ship {reading.ship_id}/Sail {reading.sail_id}: "
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] UDP -> Ship {reading.ship_id}/Sail {reading.sail_id}: "
                       f"Wind={reading.wind_speed:.1f}m/s Dir={reading.wind_direction:.0f}° "
                       f"Angle={reading.sail_angle:.1f}° Speed={reading.ship_speed:.2f}m/s "
                       f"({len(payload)} bytes)")
         except Exception as e:
             print(f"Error sending UDP packet: {e}")
+
+        if self.mqtt_client:
+            try:
+                self.mqtt_client.publish(self.mqtt_topic, payload, qos=1)
+            except Exception as e:
+                print(f"Error publishing MQTT message: {e}")
 
     def generate_reading(self, ship: ShipConfig, sail: SailConfig,
                          wind_speed: float, wind_dir: float,
@@ -365,17 +399,43 @@ class SensorSimulator:
         finally:
             self.stop_event.set()
             self.sock.close()
+            if self.mqtt_client:
+                self.mqtt_client.loop_stop()
+                self.mqtt_client.disconnect()
             print(f"✅ 模拟结束，共发送 {report_count} 条传感器数据")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="古代海船纵帆传感器模拟器")
+    parser = argparse.ArgumentParser(
+        description="古代海船纵帆传感器模拟器",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 默认UDP模式，风速8m/s风向135°
+  python sensor_simulator.py --fast --wind-speed 8 --wind-direction 135
+
+  # MQTT模式
+  python sensor_simulator.py --fast --mqtt-broker tcp://mosquitto:1883
+
+  # 只发一次用于测试
+  python sensor_simulator.py --once
+        """)
     parser.add_argument("--host", default="127.0.0.1", help="UDP目标主机地址 (默认: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8001, help="UDP目标端口 (默认: 8001)")
     parser.add_argument("--interval", type=float, default=60.0, help="正常模式上报间隔秒数 (默认: 60)")
     parser.add_argument("--fast", action="store_true", help="快进模式，每1秒=虚拟1分钟")
     parser.add_argument("--debug", action="store_true", help="显示详细调试信息")
     parser.add_argument("--once", action="store_true", help="只发送一次数据后退出")
+    parser.add_argument("--wind-speed", type=float, default=None,
+                        help="设置基础风速 m/s (默认: 每船不同 7.5/9.0/10.5)")
+    parser.add_argument("--wind-direction", type=float, default=None,
+                        help="设置基础风向 角度 0-360 (默认: 每船不同 120/150/180)")
+    parser.add_argument("--mqtt-broker", default=None,
+                        help="MQTT Broker地址，如 tcp://mosquitto:1883")
+    parser.add_argument("--mqtt-topic", default="sail/sensor",
+                        help="MQTT发布主题 (默认: sail/sensor)")
+    parser.add_argument("--transport", choices=["udp", "mqtt", "both"], default="both",
+                        help="传输方式: udp仅UDP, mqtt仅MQTT, both双发 (默认: both)")
 
     args = parser.parse_args()
 
@@ -396,6 +456,10 @@ def main():
         interval=args.interval,
         fast_mode=args.fast,
         debug=args.debug,
+        mqtt_broker=args.mqtt_broker,
+        mqtt_topic=args.mqtt_topic,
+        wind_speed=args.wind_speed,
+        wind_direction=args.wind_direction,
     )
     sim.run()
 
