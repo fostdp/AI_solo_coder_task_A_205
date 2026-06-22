@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>古代海船纵帆空气动力学仿真系统</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="app">
+        <header id="main-header">
+            <div class="header-left">
+            <div class="logo">⛵</div>
+            <div>
+                <h1>古代海船纵帆空气动力学仿真与最佳帆角优化系统</h1>
+                <p class="subtitle">宋代海船复原研究 · 涡格法 · 边界层理论 · 梯度下降优化</p>
+            </div>
+        </div>
+        <div class="header-right">
+            <div id="connection-status" class="status-indicator disconnected">
+                <span class="status-dot"></span>
+                <span id="ws-status">未连接</span>
+            </div>
+            <div id="clock" class="clock"></div>
+        </div>
+        </header>
+
+        <div id="main-layout">
+            <aside id="sidebar">
+                <section class="panel">
+                    <h2>🚢 船舶选择</h2>
+                    <select id="ship-select" class="select">
+                        <option value="1">南海一号 (宋代福船)</option>
+                        <option value="2">泉舶</option>
+                        <option value="3">广舶</option>
+                    </select>
+                </section>
+
+                <section class="panel">
+                    <h2>⛵ 风帆状态</h2>
+                    <div id="sail-list" class="sail-list"></div>
+                </section>
+
+                <section class="panel">
+                    <h2>🌬️ 当前风场</h2>
+                    <div id="wind-display">
+                        <div class="wind-compass">
+                        <svg viewBox="0 0 120 120" id="wind-svg">
+                            <circle cx="60" cy="60" r="55" class="compass-ring" fill="none" stroke="#374151" stroke-width="2"/>
+                            <text x="60" y="15" text-anchor="middle" fill="#9ca3af" font-size="10">N</text>
+                            <text x="110" y="64" text-anchor="middle" fill="#9ca3af" font-size="10">E</text>
+                            <text x="60" y="112" text-anchor="middle" fill="#9ca3af" font-size="10">S</text>
+                            <text x="10" y="64" text-anchor="middle" fill="#9ca3af" font-size="10">W</text>
+                            <g id="wind-arrow" transform="rotate(0, 60, 60)">
+                                <line x1="60" y1="90" x2="60" y2="25" stroke="#3b82f6" stroke-width="3" stroke-linecap="round"/>
+                                <polygon points="60,15 52,30 68,30" fill="#3b82f6"/>
+                            </g>
+                        </svg>
+                    </div>
+                    <div class="wind-info">
+                        <div class="wind-row"><span>风速:</span><strong id="wind-speed-val">--</strong></div>
+                        <div class="wind-row"><span>风向:</span><strong id="wind-dir-val">--</strong></div>
+                        <div class="wind-row"><span>相对风速:</span><strong id="eff-wind-val">--</strong></div>
+                    </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <h2>⚙️ 仿真控制</h2>
+                    <div class="control-group">
+                        <label>
+                            <input type="checkbox" id="show-particles" checked>
+                            显示气流粒子
+                        </label>
+                        <label>
+                            <input type="checkbox" id="show-vortices">
+                            显示涡格线
+                        </label>
+                        <label>
+                            <input type="checkbox" id="show-streamlines" checked>
+                            显示流线
+                        </label>
+                        <label>
+                            <input type="checkbox" id="animate-sails" checked>
+                            风帆动态变形
+                        </label>
+                    </div>
+                    <div class="control-group">
+                        <label>粒子密度</label>
+                        <input type="range" id="particle-density" min="50" max="500" value="200" class="slider">
+                    </div>
+                    <button id="btn-optimize" class="btn btn-primary">🔧 立即优化帆角</button>
+                </section>
+            </aside>
+
+            <main id="main-area">
+                <div id="canvas-container">
+                    <canvas id="scene-canvas"></canvas>
+                    <div id="view-controls" class="view-controls">
+                        <button data-view="side" class="view-btn">侧视图</button>
+                        <button data-view="top" class="view-btn">俯视图</button>
+                        <button data-view="front" class="view-btn">正视图</button>
+                        <button data-view="free" class="view-btn active">自由视角</button>
+                    </div>
+                    <div id="stats-overlay" class="stats-overlay">
+                        <div class="stat-card">
+                            <div class="stat-label">航速</div>
+                            <div class="stat-value" id="stat-speed">--</div>
+                            <div class="stat-unit">m/s</div>
+                        </div>
+                        <div class="stat-card highlight">
+                            <div class="stat-label">升力</div>
+                            <div class="stat-value" id="stat-lift">--</div>
+                            <div class="stat-unit">kN</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">阻力</div>
+                            <div class="stat-value" id="stat-drag">--</div>
+                            <div class="stat-unit">kN</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">攻角</div>
+                            <div class="stat-value" id="stat-aoa">--</div>
+                            <div class="stat-unit">°</div>
+                        </div>
+                        <div class="stat-card success">
+                            <div class="stat-label">升阻比</div>
+                            <div class="stat-value" id="stat-ld">--</div>
+                            <div class="stat-unit">L/D</div>
+                        </div>
+                        <div class="stat-card warning" id="stat-optimize-card" style="display:none">
+                            <div class="stat-label">优化增幅</div>
+                            <div class="stat-value" id="stat-optimize">--</div>
+                            <div class="stat-unit">%</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="data-panels">
+                    <div class="tabs">
+                        <button class="tab-btn active" data-tab="aerodynamics">空气动力学</button>
+                        <button class="tab-btn" data-tab="optimization">帆角优化</button>
+                        <button class="tab-btn" data-tab="polar">极曲线</button>
+                        <button class="tab-btn" data-tab="alerts">告警信息</button>
+                    </div>
+
+                    <div class="tab-content active" id="tab-aerodynamics">
+                        <div class="chart-container">
+                            <h3>升力/阻力系数</h3>
+                            <canvas id="chart-coefficients" class="chart"></canvas>
+                        </div>
+                        <div class="info-grid">
+                            <div class="info-item">
+                                <span>雷诺数</span>
+                                <strong id="info-re">--</strong>
+                            </div>
+                            <div class="info-item">
+                                <span>边界层厚度</span>
+                                <strong id="info-blt">--</strong>
+                            </div>
+                            <div class="info-item">
+                                <span>压力阻力</span>
+                                <strong id="info-pdrag">--</strong>
+                            </div>
+                            <div class="info-item">
+                                <span>摩擦阻力</span>
+                                <strong id="info-fdrag">--</strong>
+                            </div>
+                            <div class="info-item">
+                                <span>诱导阻力</span>
+                                <strong id="info-idrag">--</strong>
+                            </div>
+                            <div class="info-item">
+                                <span>环量强度</span>
+                                <strong id="info-cir">--</strong>
+                            </div>
+                            <div class="info-item stall-indicator">
+                                <span>失速状态</span>
+                                <strong id="info-stall">--</strong>
+                            </div>
+                            <div class="info-item">
+                                <span>涡格总数</span>
+                                <strong id="info-vortices">--</strong>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="tab-content" id="tab-optimization">
+                        <div class="optimization-layout">
+                            <div class="opt-result-card" id="opt-result">
+                                <h3>帆角优化结果</h3>
+                                <div class="opt-comparison">
+                                    <div class="opt-before">
+                                        <div class="opt-label">当前</div>
+                                        <div class="opt-angle" id="opt-angle-before">--</div>
+                                        <div class="opt-sub" id="opt-speed-before">--</div>
+                                    </div>
+                                    <div class="opt-arrow">→</div>
+                                    <div class="opt-after">
+                                        <div class="opt-label">优化后</div>
+                                        <div class="opt-angle" id="opt-angle-after">--</div>
+                                        <div class="opt-sub" id="opt-speed-after">--</div>
+                                    </div>
+                                </div>
+                                <div class="opt-details">
+                                    <div><span>迭代次数:</span> <strong id="opt-iter">--</strong></div>
+                                    <div><span>船体阻力:</span> <strong id="opt-hulldrag">--</strong></div>
+                                    <div><span>净推力:</span> <strong id="opt-thrust">--</strong></div>
+                                </div>
+                            </div>
+                            <div class="chart-container">
+                                <h3>航速优化过程</h3>
+                                <canvas id="chart-optimization" class="chart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="tab-content" id="tab-polar">
+                        <div class="chart-container">
+                            <h3>风帆极曲线 (Cl ~ Cd)</h3>
+                            <canvas id="chart-polar" class="chart"></canvas>
+                        </div>
+                        <div class="chart-container">
+                            <h3>升阻比 ~ 攻角</h3>
+                            <canvas id="chart-ld" class="chart"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="tab-content" id="tab-alerts">
+                        <div class="alert-summary" id="alert-summary"></div>
+                        <div class="alert-list" id="alert-list"></div>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <div id="alert-toast-container" id="alert-container"></div>
+
+    <script type="module" src="js/app.js"></script>
+</body>
+</html>
